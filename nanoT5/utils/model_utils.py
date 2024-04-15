@@ -1,12 +1,15 @@
+import os
+
 import torch
 import datasets
+from datasets import Dataset
 from torch.utils.data import DataLoader
 from omegaconf import open_dict
 from datasets.iterable_dataset import IterableDataset
 from transformers import (
     AutoTokenizer,
     T5ForConditionalGeneration,
-    AutoConfig,
+    AutoConfig, DataCollatorWithPadding, AutoModelForSeq2SeqLM,
 )
 
 from .copied_utils import (
@@ -18,20 +21,24 @@ from .copied_utils import (
 from .t5_model import MyT5
 
 
+os.environ["TOKENIZERS_PARALLELISM"] = "False"
+
+
 def get_model(args, config):
-    klass = {
-        'hf_t5': T5ForConditionalGeneration,
+    factory = {
+        'hf': AutoModelForSeq2SeqLM.from_config if args.model.checkpoint_path or args.model.random_init
+            else AutoModelForSeq2SeqLM.from_pretrained,
         'local_t5': MyT5,
     }[args.model.klass]
 
     if args.model.checkpoint_path:
-        model = klass(config)
+        model = factory(config)
         model.load_state_dict(torch.load(args.model.checkpoint_path))
     elif args.model.random_init:
-        model = klass(config)
+        model = factory(config)
     else:
-        assert klass == T5ForConditionalGeneration, 'To load HFs weights you need to use HF model'
-        model = klass.from_pretrained(
+        assert args.model.klass == "hf", 'To load HFs weights you need to use HF model'
+        model = factory(
             args.model.name,
             config=config,
         )
@@ -109,31 +116,24 @@ def process_dataset(dataset_splits, args, tokenizer):
         final_datasets = {}
 
         for split, dataset_split in dataset_splits.items():
+            num_tokens = args.data.num_tokens if split == "train" else int(args.data.num_tokens * args.data.test_split)
 
-            # We increase the input_length, because instead of masking tokens T5 replaces
-            # masked spans with a single token, therefore to avoid padding we need to have
-            # longer sequences at the start, before masking
-            before_mask_input_length, target_length = compute_input_and_target_lengths(
-                inputs_length=args.data.input_length,
-                noise_density=args.data.mlm_probability,
-                mean_noise_span_length=args.data.mean_noise_span_length,
-            )
-
-            with open_dict(args):
-                args.data.before_mask_input_length = before_mask_input_length
-                args.data.target_length = target_length
+            dataset_split = dataset_split.shuffle(buffer_size=10_000, seed=args.seed)
 
             dataset_split = dataset_split.map(
                 tokenize_function,
                 batched=True,
                 fn_kwargs={
                     'tokenizer': tokenizer,
-                    'in_length': before_mask_input_length,
+                    'in_length': args.data.input_length,
                 },
                 remove_columns=['text'],
             )
 
-            dataset_split = dataset_split.shuffle(buffer_size=10_000, seed=args.seed)
+            examples = [example["input_ids"] for example, _ in zip(dataset_split, range(num_tokens // args.data.input_length))]
+
+            dataset_split = Dataset.from_dict({"input_ids": examples[:-1], "labels": examples[1:]})
+
             final_datasets[split] = dataset_split
     elif args.mode == 'ft':
         final_datasets = dataset_splits
@@ -145,14 +145,7 @@ def process_dataset(dataset_splits, args, tokenizer):
 
 def get_data_collator(tokenizer, config, args):
     if args.mode == 'pt':
-        data_collator = DataCollatorForT5MLM(
-            tokenizer=tokenizer,
-            noise_density=args.data.mlm_probability,
-            mean_noise_span_length=args.data.mean_noise_span_length,
-            input_length=args.data.input_length,
-            target_length=args.data.target_length,
-            pad_token_id=config.pad_token_id,
-        )
+        data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
     elif args.mode == 'ft':
         data_collator = DataCollatorForNI(
             tokenizer,
@@ -188,11 +181,6 @@ def get_dataloaders(tokenizer, config, args):
         batch_size = args.optim.batch_size // args.optim.grad_acc
 
         shuffle = (split == 'train') and not is_iterable
-
-        if args.mode == 'ft' and split == 'train':
-            assert shuffle is True
-        else:
-            assert shuffle is False
 
         dataloaders[split] = DataLoader(
             dataset[split],

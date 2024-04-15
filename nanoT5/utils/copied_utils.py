@@ -361,7 +361,7 @@ def tokenize_function(examples, tokenizer, in_length):
         return_attention_mask=False,
     )
 
-    input_ids = tokenizer_out["input_ids"]
+    input_ids = [ids[:-1] for ids in tokenizer_out["input_ids"]]  # cut off eos tokens.
 
     concatenated_ids = np.concatenate(input_ids)
 

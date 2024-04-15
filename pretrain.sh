@@ -1,0 +1,1 @@
+accelerate launch --num_processes 4 -m nanoT5.main task=pt
